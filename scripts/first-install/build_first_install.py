@@ -24,6 +24,14 @@ PINS = {
     'UniXNU': '5dc00d201496a1e7a72d1f5db23f041eb94ace1c',
     'uefi-sheng': '66421cb7bb5694843aec8de1ca3d1de4c20cca38',
 }
+SOC_REVISION = '97665e28578483082b674e8375a8fa65f4cf49cf'
+SOC_INTERFACE_FILES = {
+    'Sm8550Gcc.c': {'bytes': 2016, 'sha256': '59a4963d0f2ef78b25c9a2cc775ead513c8e04856215db4c707e1a4dea4ce044'},
+    'Sm8550GeniUart.c': {'bytes': 1606, 'sha256': '9c7c397e5748a86a298eaff7b6a625de67fdb73c915bfcb4a3a31a4d7106eea0'},
+    'Sm8550GeniUart.h': {'bytes': 999, 'sha256': '1549ec51d15bb74133ca9d2190a7cbc87643605e64eb85466c7bb612801f9882'},
+    'Sm8550QupDma.c': {'bytes': 4749, 'sha256': 'd2ba602e1281343a0d1a27f0d11312486df721b243df40fe201109c4411e0f54'},
+    'Sm8550QupDma.h': {'bytes': 1277, 'sha256': 'bf28dfd47f38a4d041d4dc892317f52ce1b812a7b69731ac3d32dc2b44fa5abe'},
+}
 FIRST_LBA = 3094592
 LAST_LBA = 64007162
 LBA_BYTES = 4096
@@ -59,7 +67,13 @@ WIFI_SPARSE_OVERLAY = {
     'after_sha256': 'b5dee6e18df64908f29781ce1c1d2e90517cac952d25409ff4185b7c5a7770da',
     'reason': 'Use non-cone sparse-checkout for the locked leading-slash patterns and single-file entries; source-lock pins are unchanged.',
 }
-OVERLAYS = (OVERLAY, WIFI_SOURCE_OVERLAY, WIFI_SPARSE_OVERLAY)
+SOC_FEEDS_OVERLAY = {
+    'path': 'device:feeds.toml',
+    'before_sha256': '7161a4ff953959b2bf2ab3f3bd601d837012fdbfece82f4cb44e8fac1ba1adbe',
+    'after_sha256': '5de91b98c852853983180d1a04e23ed5b64443f7d793edbca483a87dbd5f5390',
+    'reason': 'Select the reviewed SM8550 platform commit that adds the GCC, GENI UART and QUP DMA providers required by the board; existing DTSI/config/XNU patches and GPU inputs are unchanged.',
+}
+OVERLAYS = (OVERLAY, WIFI_SOURCE_OVERLAY, WIFI_SPARSE_OVERLAY, SOC_FEEDS_OVERLAY)
 
 
 def fail(message):
@@ -266,18 +280,62 @@ def apply_overlay(workspace):
             if before.count(anchor) != 1 or addition in before:
                 fail('The reviewed Wi-Fi source-preparation insertion no longer applies exactly.')
             after = before.replace(anchor, addition + anchor, 1)
-        else:
+        elif overlay is WIFI_SPARSE_OVERLAY:
             anchor = b'        subprocess.run(["git", "-C", str(directory), "sparse-checkout", "add", *source["paths"]], check=True)\n'
             replacement = b'        subprocess.run(["git", "-C", str(directory), "sparse-checkout", "set", "--no-cone", *source["paths"]], check=True)\n'
             if before.count(anchor) != 1:
                 fail('The reviewed Ath12kWifi non-cone sparse-checkout replacement no longer applies exactly.')
             after = before.replace(anchor, replacement, 1)
+        else:
+            previous = b'a9f45dc60c035084b95463781538380f4c3606c9'
+            if before.count(previous) != 1 or SOC_REVISION.encode('ascii') in before:
+                fail('The reviewed SoC source-pin replacement no longer applies exactly.')
+            after = before.replace(previous, SOC_REVISION.encode('ascii'), 1)
         if hashlib.sha256(after).hexdigest() != overlay['after_sha256']:
             fail('A reviewed source-overlay output differs from its pinned hash: ' + overlay['path'])
         planned.append((target, after))
     for target, after in planned:
         target.write_bytes(after)
     return [dict(overlay) for overlay in OVERLAYS]
+
+
+def prepare_soc(workspace):
+    main = workspace / 'UniXNU'
+    evidence = workspace / 'installation-evidence'
+    command([sys.executable, main / 'unixnu', 'defconfig', 'sheng_ipados27_defconfig', '--device', workspace / 'device'],
+            main, log_file=evidence / 'soc-defconfig.stdout.log')
+    result = subprocess.run([sys.executable, str(main / 'unixnu'), 'status', '--device', str(workspace / 'device'), '--json'],
+                            cwd=main, capture_output=True, text=True)
+    evidence.mkdir(exist_ok=True)
+    with (evidence / 'soc-status.stdout.log').open('x', encoding='utf-8') as output:
+        output.write(redact(result.stdout))
+        output.write(redact(result.stderr))
+    if result.returncode:
+        fail('SoC status failed; inspect the redacted SoC preparation logs.')
+    status = json.loads(result.stdout)
+    selected = [row for row in status['modules'] if row['kind'] == 'soc' and row['name'] == 'sm8550']
+    if (len(selected) != 1 or selected[0].get('revision') != SOC_REVISION or
+            selected[0].get('pin') != SOC_REVISION or selected[0].get('local')):
+        fail('The effective sm8550 source pin differs from the reviewed fixed revision.')
+    source = Path(status['profiles']['soc'])
+    if not source.resolve().is_relative_to((main / 'out' / 'feeds').resolve()) or source.is_symlink():
+        fail('The resolved SoC source is outside the normal build feed cache.')
+    actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+    if actual != SOC_REVISION:
+        fail('The resolved SoC checkout HEAD differs from the reviewed fixed revision.')
+    files = {}
+    for name, expected in SOC_INTERFACE_FILES.items():
+        path = source / 'kits' / 'Sm8550Platform' / name
+        if (not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(source.resolve()) or
+                path.stat().st_size != expected['bytes'] or sha256(path) != expected['sha256']):
+            fail('The selected SoC lacks a matching reviewed platform interface: ' + name)
+        files[name] = {'bytes': path.stat().st_size, 'sha256': sha256(path)}
+    report = {'soc_revision': actual, 'source': 'UniXNU CLI status and actual Git HEAD', 'files': files}
+    with (evidence / 'soc-source.json').open('x', encoding='utf-8') as output:
+        json.dump(report, output, indent=2)
+        output.write('\n')
+    print('Effective sm8550 pin, checkout HEAD and five reviewed platform interfaces passed source validation.')
+    return report
 
 
 def prepare_wifi_sources(workspace):
@@ -432,6 +490,9 @@ def collect_logs(workspace):
         'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
         'source_overlays': applied, 'diagnostic_bytes': total,
     }, indent=2) + '\n', encoding='utf-8')
+    soc_report = workspace / 'installation-evidence' / 'soc-source.json'
+    if soc_report.is_file() and not soc_report.is_symlink():
+        (target / 'soc-source.json').write_text(redact(soc_report.read_text(encoding='utf-8')), encoding='utf-8')
 
 
 def preflight(workspace):
@@ -469,6 +530,10 @@ def verify(workspace):
     package = read_json(work / 'package.manifest.json')
     if package['device'] != 'sheng' or package['os_profile'] != PROFILE:
         fail('The package manifest targets another device or OS.')
+    soc_revision = package['revisions'].get('soc:sm8550')
+    soc_inputs = read_json(workspace / 'installation-evidence' / 'soc-source.json')
+    if soc_revision != SOC_REVISION or soc_inputs.get('soc_revision') != soc_revision or soc_inputs.get('files') != SOC_INTERFACE_FILES:
+        fail('The package SoC revision or prepared platform-interface evidence differs from the reviewed source.')
     boot = work / 'boot' / 'boot.img'
     if not 0 < boot.stat().st_size <= BOOT_BYTES:
         fail('The boot image does not fit the measured 192 MiB boot partition.')
@@ -535,6 +600,8 @@ def verify(workspace):
         'device': 'sheng',
         'os_profile': PROFILE,
         'source_revisions': PINS,
+        'soc_revision': soc_revision,
+        'soc_inputs': soc_inputs,
         'source_overlays': [dict(overlay) for overlay in OVERLAYS],
         'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
         'original_seed_sha256': ORIGINAL_SEED_SHA256,
@@ -574,6 +641,7 @@ def build(workspace):
     restore_cache(workspace)
     seed = restore_seed(workspace)
     apply_overlay(workspace)
+    prepare_soc(workspace)
     stage_wifi_firmware(workspace)
     prepare_wifi_sources(workspace)
     command(['bash', 'scripts/package.sh', '--os', '27', '--uefi', '../uefi-sheng', '--data-ramdisk', seed],
