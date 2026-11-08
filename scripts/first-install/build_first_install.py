@@ -47,6 +47,19 @@ OVERLAY = {
     'after_sha256': 'cd15bbb8f932d564a99300e63d3d6c5a6a714b311596e80619092c5d3fa5e25a',
     'reason': 'Declare the first new-file diff as mode 100644 so git apply does not treat /dev/null as a source path; hunk bytes are unchanged.',
 }
+WIFI_SOURCE_OVERLAY = {
+    'path': 'device:scripts/build-wifi-userspace.py',
+    'before_sha256': 'c4c251a96af4983df16a7b01b1b2074530df1c367ce2da364246ef839f819845',
+    'after_sha256': '55349cf256cb6f3fb46a777fcdc611c7c7c5bf35fd692bb2d27412a214c28569',
+    'reason': 'Resolve and verify Ath12kWifi locked public source inputs before its supplicant builder; component source pins and runtime interfaces are unchanged.',
+}
+WIFI_SPARSE_OVERLAY = {
+    'path': 'device:drivers/Ath12kWifi/tools/fetch-sources.py',
+    'before_sha256': '6d8dd881a848e09f0cd41660c4b346b99b1d52b379948198ecc7500a4841f2b0',
+    'after_sha256': 'b5dee6e18df64908f29781ce1c1d2e90517cac952d25409ff4185b7c5a7770da',
+    'reason': 'Use non-cone sparse-checkout for the locked leading-slash patterns and single-file entries; source-lock pins are unchanged.',
+}
+OVERLAYS = (OVERLAY, WIFI_SOURCE_OVERLAY, WIFI_SPARSE_OVERLAY)
 
 
 def fail(message):
@@ -223,19 +236,58 @@ def stage_wifi_firmware(workspace, allow_download=True):
             'files': records, 'verified': True}
 
 
+def overlay_target(workspace, overlay):
+    if overlay['path'].startswith('device:'):
+        return workspace / 'device' / overlay['path'][len('device:'):]
+    return workspace / 'UniXNU' / overlay['path']
+
+
+def applied_overlays(workspace):
+    return [dict(overlay) for overlay in OVERLAYS
+            if overlay_target(workspace, overlay).is_file() and
+            sha256(overlay_target(workspace, overlay)) == overlay['after_sha256']]
+
+
 def apply_overlay(workspace):
-    target = workspace / 'UniXNU' / OVERLAY['path']
-    before = target.read_bytes()
-    if hashlib.sha256(before).hexdigest() != OVERLAY['before_sha256']:
-        fail('The reviewed Mesa patch overlay input differs from its pinned hash.')
-    first, separator, rest = before.partition(b'\n')
-    if not separator or not first.startswith(b'diff --git ') or rest.startswith(b'new file mode '):
-        fail('The reviewed Mesa new-file metadata overlay no longer applies exactly.')
-    after = first + b'\nnew file mode 100644\n' + rest
-    if hashlib.sha256(after).hexdigest() != OVERLAY['after_sha256']:
-        fail('The reviewed Mesa patch overlay output differs from its pinned hash.')
-    target.write_bytes(after)
-    return [dict(OVERLAY)]
+    planned = []
+    for overlay in OVERLAYS:
+        target = overlay_target(workspace, overlay)
+        before = target.read_bytes()
+        if hashlib.sha256(before).hexdigest() != overlay['before_sha256']:
+            fail('A reviewed source-overlay input differs from its pinned hash: ' + overlay['path'])
+        if overlay is OVERLAY:
+            first, separator, rest = before.partition(b'\n')
+            if not separator or not first.startswith(b'diff --git ') or rest.startswith(b'new file mode '):
+                fail('The reviewed Mesa new-file metadata overlay no longer applies exactly.')
+            after = first + b'\nnew file mode 100644\n' + rest
+        elif overlay is WIFI_SOURCE_OVERLAY:
+            anchor = b'subprocess.run([sys.executable, component / "tools/build-supplicant.py", "--target", "ios"], check=True)\n'
+            addition = b'subprocess.run([sys.executable, component / "tools/fetch-sources.py"], check=True)\n'
+            if before.count(anchor) != 1 or addition in before:
+                fail('The reviewed Wi-Fi source-preparation insertion no longer applies exactly.')
+            after = before.replace(anchor, addition + anchor, 1)
+        else:
+            anchor = b'        subprocess.run(["git", "-C", str(directory), "sparse-checkout", "add", *source["paths"]], check=True)\n'
+            replacement = b'        subprocess.run(["git", "-C", str(directory), "sparse-checkout", "set", "--no-cone", *source["paths"]], check=True)\n'
+            if before.count(anchor) != 1:
+                fail('The reviewed Ath12kWifi non-cone sparse-checkout replacement no longer applies exactly.')
+            after = before.replace(anchor, replacement, 1)
+        if hashlib.sha256(after).hexdigest() != overlay['after_sha256']:
+            fail('A reviewed source-overlay output differs from its pinned hash: ' + overlay['path'])
+        planned.append((target, after))
+    for target, after in planned:
+        target.write_bytes(after)
+    return [dict(overlay) for overlay in OVERLAYS]
+
+
+def prepare_wifi_sources(workspace):
+    component = workspace / 'device' / 'drivers' / 'Ath12kWifi'
+    tool = component / 'tools' / 'fetch-sources.py'
+    if not tool.is_file() or tool.is_symlink():
+        fail('Ath12kWifi locked source fetcher is missing or is a filesystem link.')
+    evidence = workspace / 'installation-evidence'
+    command([sys.executable, tool], component, log_file=evidence / 'wifi-source-prepare.stdout.log')
+    command([sys.executable, tool, '--check'], component, log_file=evidence / 'wifi-source-check.stdout.log')
 
 
 def cache_record(path):
@@ -354,10 +406,8 @@ def collect_cache(workspace):
 def collect_logs(workspace):
     target = workspace / 'redacted-build-logs'
     target.mkdir(exist_ok=True)
-    sources = []
-    package_log = workspace / 'installation-evidence' / 'package.stdout.log'
-    if package_log.is_file():
-        sources.append(package_log)
+    evidence = workspace / 'installation-evidence'
+    sources = sorted(path for path in evidence.glob('*.stdout.log') if path.is_file() and not path.is_symlink())
     directory = work_path(workspace) / 'logs'
     if directory.is_dir():
         sources += sorted(path for path in directory.glob('*.log') if path.is_file() and not path.is_symlink())
@@ -376,8 +426,7 @@ def collect_logs(workspace):
         data = redact(body).encode('utf-8')
         (target / f'{index:02}-{source.name}').write_bytes(data)
         total += len(data)
-    patch = workspace / 'UniXNU' / OVERLAY['path']
-    applied = [OVERLAY] if patch.is_file() and sha256(patch) == OVERLAY['after_sha256'] else []
+    applied = applied_overlays(workspace)
     (target / 'context.json').write_text(json.dumps({
         'source_revisions': PINS, 'original_seed_sha256': ORIGINAL_SEED_SHA256,
         'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
@@ -451,8 +500,8 @@ def verify(workspace):
         fail('The package and runtime Data UUIDs differ.')
     if payload['data_ramdisk_sha256'] != seed_pin:
         fail('The boot payload and saved Data seed are from different installations.')
-    if sha256(workspace / 'UniXNU' / OVERLAY['path']) != OVERLAY['after_sha256']:
-        fail('The reviewed Mesa metadata overlay is missing or has changed.')
+    if len(applied_overlays(workspace)) != len(OVERLAYS):
+        fail('A reviewed source overlay is missing or has changed.')
 
     root_dir = work / 'userdata-first-install'
     root_image = root_dir / 'userdata-root.img'
@@ -486,7 +535,7 @@ def verify(workspace):
         'device': 'sheng',
         'os_profile': PROFILE,
         'source_revisions': PINS,
-        'source_overlays': [dict(OVERLAY)],
+        'source_overlays': [dict(overlay) for overlay in OVERLAYS],
         'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
         'original_seed_sha256': ORIGINAL_SEED_SHA256,
         'runtime_firmware': {'wcn7850': wifi},
@@ -526,6 +575,7 @@ def build(workspace):
     seed = restore_seed(workspace)
     apply_overlay(workspace)
     stage_wifi_firmware(workspace)
+    prepare_wifi_sources(workspace)
     command(['bash', 'scripts/package.sh', '--os', '27', '--uefi', '../uefi-sheng', '--data-ramdisk', seed],
             workspace / 'device', log_file=workspace / 'installation-evidence' / 'package.stdout.log')
     target = work_path(workspace) / 'userdata-first-install'
