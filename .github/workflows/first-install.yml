@@ -4,13 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       first_install_confirm:
-        description: Create a NEW installation seed for a tablet that has no UniXNU installation
+        description: Build the first installation using its preserved original Data seed
         type: boolean
         required: true
+        default: false
+      seed_run_id:
+        description: Earlier run containing the verified original sheng-first-install-seed artifact
+        type: string
+        required: true
+        default: '42471601740'
+      cache_decrypted_os:
+        description: Opt in to caching only the decrypted OS image, limited to 8 GiB
+        type: boolean
+        required: false
         default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: sheng-first-install-${{ github.repository }}
@@ -23,6 +34,8 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: "1"
+      PRESERVED_SEED_RUN_ID: ${{ inputs.seed_run_id }}
+      CACHE_DECRYPTED_OS: ${{ inputs.cache_decrypted_os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,6 +48,26 @@ jobs:
           path: device
           submodules: recursive
           persist-credentials: false
+      - name: Restore the original installation seed
+        uses: actions/download-artifact@v4
+        with:
+          name: sheng-first-install-seed
+          run-id: ${{ inputs.seed_run_id }}
+          github-token: ${{ github.token }}
+          path: preserved-seed
+      - name: Restore small public IPSW inputs
+        id: ipsw-small
+        uses: actions/cache/restore@v4
+        with:
+          path: .first-install-cache/ipsw-small
+          key: sheng-ipsw-small-24A446-v1
+      - name: Restore the optional decrypted OS cache
+        if: inputs.cache_decrypted_os
+        id: ipsw-os
+        uses: actions/cache/restore@v4
+        with:
+          path: .first-install-cache/ipsw-os
+          key: sheng-ipsw-os-24A446-8a12cdad-v1
       - uses: actions/checkout@v4
         with:
           repository: UniXNU/UniXNU
@@ -64,6 +97,35 @@ jobs:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 installer/scripts/first-install/build_first_install.py build --workspace "$GITHUB_WORKSPACE"
+      - name: Prepare bounded public IPSW caches
+        if: always()
+        run: python3 installer/scripts/first-install/build_first_install.py collect-cache --workspace "$GITHUB_WORKSPACE"
+      - name: Save small public IPSW inputs
+        if: always() && steps.ipsw-small.outputs.cache-hit != 'true' && hashFiles('.first-install-cache/ipsw-small/*') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .first-install-cache/ipsw-small
+          key: sheng-ipsw-small-24A446-v1
+      - name: Save the optional decrypted OS cache
+        if: always() && inputs.cache_decrypted_os && steps.ipsw-os.outputs.cache-hit != 'true' && hashFiles('.first-install-cache/ipsw-os/*') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .first-install-cache/ipsw-os
+          key: sheng-ipsw-os-24A446-8a12cdad-v1
+      - name: Collect redacted build diagnostics
+        if: always()
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 installer/scripts/first-install/build_first_install.py collect-logs --workspace "$GITHUB_WORKSPACE"
+      - name: Preserve redacted build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheng-first-install-diagnostics
+          retention-days: 1
+          if-no-files-found: warn
+          path: redacted-build-logs/
       - name: Preserve the new installation seed
         if: always() && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
         uses: actions/upload-artifact@v4

@@ -26,6 +26,16 @@ LAST_LBA = 64007162
 LBA_BYTES = 4096
 USERDATA_BYTES = 249497890816
 BOOT_BYTES = 201326592
+ORIGINAL_SEED_SHA256 = '8359108a2ac862b6bb3e6cd6398a506bdd16345ccc15bfc844005672cc44bb0b'
+OS_DISK_IMAGE = '043-68950-668.dmg'
+SMALL_CACHE_LIMIT = 256 * 1024 ** 2
+OS_CACHE_LIMIT = 8 * 1024 ** 3
+OVERLAY = {
+    'path': 'patches/mesa/turnip-frame-diagnostics.patch',
+    'before_sha256': '5eb8dda6e381f10fa48b62a9a497fb74a8b08c7999dea5468585c9848b2af966',
+    'after_sha256': 'cd15bbb8f932d564a99300e63d3d6c5a6a714b311596e80619092c5d3fa5e25a',
+    'reason': 'Declare the first new-file diff as mode 100644 so git apply does not treat /dev/null as a source path; hunk bytes are unchanged.',
+}
 
 
 def fail(message):
@@ -44,12 +54,194 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
-def command(args, cwd):
-    subprocess.run([str(arg) for arg in args], cwd=cwd, check=True)
+def redact(text):
+    for name in ('UNIXNU_UNIQUE_CHIP_ID', 'GITHUB_TOKEN', 'GH_TOKEN'):
+        value = os.environ.get(name, '')
+        if value:
+            text = re.sub(re.escape(value), '[secret redacted]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b', '[credential redacted]', text)
+    text = re.sub(r'base64:[A-Za-z0-9+/=]+', '[key redacted]', text)
+    return re.sub(r'https?://[^\s<>"\']+', lambda match: match.group(0).split('?', 1)[0] +
+                  ('?[query redacted]' if '?' in match.group(0) else ''), text)
+
+
+def command(args, cwd, log_file=None):
+    argv = [str(arg) for arg in args]
+    if log_file is None:
+        subprocess.run(argv, cwd=cwd, check=True)
+        return
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open('x', encoding='utf-8') as output:
+        process = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for raw in iter(lambda: process.stdout.readline(1024 * 1024), b''):
+            text = redact(raw.decode('utf-8', errors='replace'))
+            output.write(text)
+            print(text, end='', flush=True)
+        result = process.wait()
+    if result:
+        raise subprocess.CalledProcessError(result, argv)
 
 
 def work_path(workspace):
     return workspace / 'UniXNU' / 'out' / 'sheng' / PROFILE / CONFIG
+
+
+def preserved_seed(workspace):
+    run = os.environ.get('PRESERVED_SEED_RUN_ID', '')
+    if not run.isdigit() or int(run) <= 0:
+        fail('A prior run containing the original installation seed is required; this retry never creates a new seed.')
+    source = workspace / 'preserved-seed' / 'data.dbr'
+    if not source.is_file() or source.is_symlink() or sha256(source) != ORIGINAL_SEED_SHA256:
+        fail('The downloaded Data seed differs from the verified original installation seed.')
+    return source
+
+
+def restore_seed(workspace):
+    source = preserved_seed(workspace)
+    target = work_path(workspace) / 'runtime' / 'data.dbr'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if target.is_symlink() or sha256(target) != ORIGINAL_SEED_SHA256:
+            fail('An existing runtime seed differs; refusing replacement.')
+    else:
+        with source.open('rb') as incoming, target.open('xb') as output:
+            shutil.copyfileobj(incoming, output, 512 * 1024)
+    if sha256(target) != ORIGINAL_SEED_SHA256:
+        fail('Restored runtime seed hash differs from the verified original.')
+    return target
+
+
+def apply_overlay(workspace):
+    target = workspace / 'UniXNU' / OVERLAY['path']
+    before = target.read_bytes()
+    if hashlib.sha256(before).hexdigest() != OVERLAY['before_sha256']:
+        fail('The reviewed Mesa patch overlay input differs from its pinned hash.')
+    first, separator, rest = before.partition(b'\n')
+    if not separator or not first.startswith(b'diff --git ') or rest.startswith(b'new file mode '):
+        fail('The reviewed Mesa new-file metadata overlay no longer applies exactly.')
+    after = first + b'\nnew file mode 100644\n' + rest
+    if hashlib.sha256(after).hexdigest() != OVERLAY['after_sha256']:
+        fail('The reviewed Mesa patch overlay output differs from its pinned hash.')
+    target.write_bytes(after)
+    return [dict(OVERLAY)]
+
+
+def cache_record(path):
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 64 * 1024:
+        return None
+    try:
+        data = read_json(path)
+    except (ValueError, OSError):
+        return None
+    allowed = {'member', 'size', 'bytes', 'sha256', 'aea_sha256'}
+    if not isinstance(data, dict) or set(data) - allowed:
+        return None
+    if any(not isinstance(value, (str, int)) for value in data.values()):
+        return None
+    if any(isinstance(value, str) and ('://' in value or '?' in value or 'token' in value.lower()) for value in data.values()):
+        return None
+    return data
+
+
+def copy_cache_file(source, target):
+    if source.is_symlink() or not source.is_file():
+        fail('IPSW cache contains a link or missing file.')
+    if target.exists():
+        if target.is_symlink() or sha256(target) != sha256(source):
+            fail('IPSW cache conflicts with a local file; refusing replacement.')
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with source.open('rb') as incoming, target.open('xb') as output:
+        shutil.copyfileobj(incoming, output, 512 * 1024)
+
+
+def restore_cache(workspace):
+    target = workspace / 'UniXNU' / 'out' / 'ipsw' / '24A446'
+    for name in ('ipsw-small', 'ipsw-os'):
+        source = workspace / '.first-install-cache' / name
+        if not source.is_dir() or source.is_symlink():
+            continue
+        for record in source.glob('*.json'):
+            metadata = cache_record(record)
+            if metadata is None:
+                fail('Restored IPSW cache metadata contains unexpected fields or values.')
+            copy_cache_file(record, target / record.name)
+            payload = record.with_suffix('')
+            if payload.is_file():
+                if sha256(payload) != metadata.get('sha256'):
+                    fail('Restored IPSW cache payload differs from its recorded hash.')
+                copy_cache_file(payload, target / payload.name)
+
+
+def collect_cache(workspace):
+    source = workspace / 'UniXNU' / 'out' / 'ipsw' / '24A446'
+    if not source.is_dir():
+        return
+    output = workspace / '.first-install-cache'
+    small_total = 0
+    for payload in sorted(source.iterdir()):
+        if (not payload.is_file() or payload.is_symlink() or
+                not (payload.suffix in ('.im4p', '.trustcache', '.im4m') or payload.name.startswith(('kernelcache.', 'DeviceTree.')))):
+            continue
+        size = payload.stat().st_size
+        record = payload.with_suffix(payload.suffix + '.json')
+        metadata = cache_record(record)
+        if metadata is None or small_total + size + record.stat().st_size > SMALL_CACHE_LIMIT:
+            continue
+        if sha256(payload) != metadata.get('sha256'):
+            fail('IPSW small cache payload differs from its recorded hash.')
+        target = output / 'ipsw-small'
+        copy_cache_file(payload, target / payload.name)
+        copy_cache_file(record, target / record.name)
+        small_total += size + record.stat().st_size
+    if os.environ.get('CACHE_DECRYPTED_OS', '').lower() == 'true':
+        payload = source / OS_DISK_IMAGE
+        record = payload.with_suffix(payload.suffix + '.json')
+        origin = payload.with_suffix(payload.suffix + '.aea.json')
+        metadata, archive = cache_record(record), cache_record(origin)
+        if payload.is_file() and not payload.is_symlink() and metadata and archive:
+            if payload.stat().st_size > OS_CACHE_LIMIT:
+                print('Decrypted OS cache skipped because it exceeds the optional 8 GiB limit.')
+            elif (sha256(payload) != metadata.get('sha256') or metadata.get('aea_sha256') != archive.get('sha256')):
+                fail('Decrypted OS cache identities do not match.')
+            else:
+                for item in (payload, record, origin):
+                    copy_cache_file(item, output / 'ipsw-os' / item.name)
+    print(f'Prepared at most {SMALL_CACHE_LIMIT // 1024 ** 2} MiB of public IPSW members; decrypted OS caching is explicit opt-in.')
+
+
+def collect_logs(workspace):
+    target = workspace / 'redacted-build-logs'
+    target.mkdir(exist_ok=True)
+    sources = []
+    package_log = workspace / 'installation-evidence' / 'package.stdout.log'
+    if package_log.is_file():
+        sources.append(package_log)
+    directory = work_path(workspace) / 'logs'
+    if directory.is_dir():
+        sources += sorted(path for path in directory.glob('*.log') if path.is_file() and not path.is_symlink())
+    total = 0
+    for index, source in enumerate(sources):
+        if total >= 32 * 1024 ** 2:
+            break
+        limit = min(8 * 1024 ** 2, 32 * 1024 ** 2 - total)
+        with source.open('rb') as incoming:
+            if source.stat().st_size > limit:
+                incoming.seek(-limit, os.SEEK_END)
+                body = '[Earlier log content omitted to keep this diagnostic artifact bounded.]\n'
+            else:
+                body = ''
+            body += incoming.read(limit).decode('utf-8', errors='replace')
+        data = redact(body).encode('utf-8')
+        (target / f'{index:02}-{source.name}').write_bytes(data)
+        total += len(data)
+    patch = workspace / 'UniXNU' / OVERLAY['path']
+    applied = [OVERLAY] if patch.is_file() and sha256(patch) == OVERLAY['after_sha256'] else []
+    (target / 'context.json').write_text(json.dumps({
+        'source_revisions': PINS, 'original_seed_sha256': ORIGINAL_SEED_SHA256,
+        'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
+        'source_overlays': applied, 'diagnostic_bytes': total,
+    }, indent=2) + '\n', encoding='utf-8')
 
 
 def preflight(workspace):
@@ -74,6 +266,7 @@ def preflight(workspace):
     helper = Path(__file__).with_name('rebuild_vroot.py')
     if not helper.is_file():
         fail('Missing reviewed rebuild_vroot.py helper.')
+    preserved_seed(workspace)
     print('Source revisions, target profile and measured partition capacity match the installation plan.')
     print('The start/end LBA values are source references; direct GPT confirmation is still required before flashing.')
     print(f'Available disk space: {shutil.disk_usage(workspace).free / 2**30:.1f} GiB')
@@ -105,6 +298,8 @@ def verify(workspace):
     runtime = read_json(work / 'runtime' / 'inputs.json')
     seed = work / 'runtime' / 'data.dbr'
     seed_pin = runtime['inputs']['data_ramdisk']['sha256']
+    if seed_pin != ORIGINAL_SEED_SHA256:
+        fail('Runtime selected another installation seed; refusing changed Data identity.')
     if sha256(seed) != seed_pin:
         fail('The saved installation seed differs from runtime inputs.')
     if package['runtime']['inputs']['data_ramdisk'] != seed_pin:
@@ -113,6 +308,8 @@ def verify(workspace):
         fail('The package and runtime Data UUIDs differ.')
     if payload['data_ramdisk_sha256'] != seed_pin:
         fail('The boot payload and saved Data seed are from different installations.')
+    if sha256(workspace / 'UniXNU' / OVERLAY['path']) != OVERLAY['after_sha256']:
+        fail('The reviewed Mesa metadata overlay is missing or has changed.')
 
     root_dir = work / 'userdata-first-install'
     root_image = root_dir / 'userdata-root.img'
@@ -146,6 +343,9 @@ def verify(workspace):
         'device': 'sheng',
         'os_profile': PROFILE,
         'source_revisions': PINS,
+        'source_overlays': [dict(OVERLAY)],
+        'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
+        'original_seed_sha256': ORIGINAL_SEED_SHA256,
         'partition_measurements': {
             'userdata_bytes': USERDATA_BYTES,
             'boot_partition_bytes': BOOT_BYTES,
@@ -178,7 +378,11 @@ def verify(workspace):
 
 def build(workspace):
     preflight(workspace)
-    command(['bash', 'scripts/package.sh', '--os', '27', '--uefi', '../uefi-sheng', '--init-data'], workspace / 'device')
+    restore_cache(workspace)
+    seed = restore_seed(workspace)
+    apply_overlay(workspace)
+    command(['bash', 'scripts/package.sh', '--os', '27', '--uefi', '../uefi-sheng', '--data-ramdisk', seed],
+            workspace / 'device', log_file=workspace / 'installation-evidence' / 'package.stdout.log')
     target = work_path(workspace) / 'userdata-first-install'
     command([
         sys.executable, Path(__file__).with_name('rebuild_vroot.py'), 'assemble',
@@ -191,11 +395,12 @@ def build(workspace):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('preflight', 'build', 'verify'))
+    parser.add_argument('operation', choices=('preflight', 'build', 'verify', 'collect-cache', 'collect-logs'))
     parser.add_argument('--workspace', type=Path, required=True)
     args = parser.parse_args()
     workspace = args.workspace.resolve()
-    {'preflight': preflight, 'build': build, 'verify': verify}[args.operation](workspace)
+    {'preflight': preflight, 'build': build, 'verify': verify,
+     'collect-cache': collect_cache, 'collect-logs': collect_logs}[args.operation](workspace)
 
 
 if __name__ == '__main__':
