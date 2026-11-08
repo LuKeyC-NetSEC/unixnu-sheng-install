@@ -21,7 +21,7 @@ PROFILE = 'ipados-27.0.1-24A446'
 CONFIG = 'sheng_ipados27'
 PINS = {
     'device': '689400177f93219a38bd7cf5ae2e9f5782adc594',
-    'UniXNU': '82b847c4ac3f68a57024b3082ffa3a03442defd9',
+    'UniXNU': '5dc00d201496a1e7a72d1f5db23f041eb94ace1c',
     'uefi-sheng': '66421cb7bb5694843aec8de1ca3d1de4c20cca38',
 }
 FIRST_LBA = 3094592
