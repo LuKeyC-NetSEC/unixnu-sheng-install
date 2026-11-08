@@ -1,0 +1,104 @@
+name: Sheng first installation
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_install_confirm:
+        description: Create a NEW installation seed for a tablet that has no UniXNU installation
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sheng-first-install-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: inputs.first_install_confirm
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: installer
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: 689400177f93219a38bd7cf5ae2e9f5782adc594
+          path: device
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: 82b847c4ac3f68a57024b3082ffa3a03442defd9
+          path: UniXNU
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          ref: 66421cb7bb5694843aec8de1ca3d1de4c20cca38
+          path: uefi-sheng
+          submodules: recursive
+          persist-credentials: false
+      - name: Check installation inputs
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: python3 installer/scripts/first-install/build_first_install.py preflight --workspace "$GITHUB_WORKSPACE"
+      - name: Check signed root preparation
+        env:
+          UNIXNU_DEVICE: ${{ github.workspace }}/device
+        run: python3 installer/scripts/first-install/test_rebuild_vroot.py
+      - name: Install and check build tools
+        run: bash installer/scripts/first-install/install-tools.sh
+      - name: Build boot image and authenticated userdata
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 installer/scripts/first-install/build_first_install.py build --workspace "$GITHUB_WORKSPACE"
+      - name: Preserve the new installation seed
+        if: always() && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheng-first-install-seed
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/inputs.json
+      - name: Save verified installation images
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheng-first-install-images
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
+          path: |
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/boot/boot.img
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/boot/boot.json
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/package.manifest.json
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/payload/payload.json
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/inputs.json
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/userdata-first-install/userdata-root.img
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/userdata-first-install/userdata-root.json
+            installation-evidence/installation.json
+      - name: Record result
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ job.status }}
+        run: |
+          {
+            echo "First-install build result: $BUILD_OUTCOME"
+            echo "No device is attached to this runner; hardware boot is not verified."
+            echo "Download both artifacts and preserve data.dbr before deleting the run."
+            echo "Images are specific to the platform seed in this repository's secret."
+            echo "Userdata capacity was measured by fastboot; its starting LBA still needs direct GPT confirmation."
+          } >> "$GITHUB_STEP_SUMMARY"
