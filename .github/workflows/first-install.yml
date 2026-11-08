@@ -14,7 +14,7 @@ on:
         required: true
         default: '42471601740'
       cache_decrypted_os:
-        description: Opt in to caching only the decrypted OS image, limited to 8 GiB
+        description: Opt in to caching only the decrypted OS image, limited to 9 GiB
         type: boolean
         required: false
         default: false
@@ -60,14 +60,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .first-install-cache/ipsw-small
-          key: sheng-ipsw-small-24A446-v1
+          key: sheng-ipsw-small-24A446-v2
       - name: Restore the optional decrypted OS cache
         if: inputs.cache_decrypted_os
         id: ipsw-os
         uses: actions/cache/restore@v4
         with:
           path: .first-install-cache/ipsw-os
-          key: sheng-ipsw-os-24A446-8a12cdad-v1
+          key: sheng-ipsw-os-24A446-8a12cdad-v2
       - uses: actions/checkout@v4
         with:
           repository: UniXNU/UniXNU
@@ -105,13 +105,13 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .first-install-cache/ipsw-small
-          key: sheng-ipsw-small-24A446-v1
+          key: sheng-ipsw-small-24A446-v2
       - name: Save the optional decrypted OS cache
         if: always() && inputs.cache_decrypted_os && steps.ipsw-os.outputs.cache-hit != 'true' && hashFiles('.first-install-cache/ipsw-os/*') != ''
         uses: actions/cache/save@v4
         with:
           path: .first-install-cache/ipsw-os
-          key: sheng-ipsw-os-24A446-8a12cdad-v1
+          key: sheng-ipsw-os-24A446-8a12cdad-v2
       - name: Collect redacted build diagnostics
         if: always()
         env:

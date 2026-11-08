@@ -12,6 +12,9 @@ import struct
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.request
+import uuid
 
 
 PROFILE = 'ipados-27.0.1-24A446'
@@ -29,7 +32,15 @@ BOOT_BYTES = 201326592
 ORIGINAL_SEED_SHA256 = '8359108a2ac862b6bb3e6cd6398a506bdd16345ccc15bfc844005672cc44bb0b'
 OS_DISK_IMAGE = '043-68950-668.dmg'
 SMALL_CACHE_LIMIT = 256 * 1024 ** 2
-OS_CACHE_LIMIT = 8 * 1024 ** 3
+OS_CACHE_LIMIT = 9 * 1024 ** 3
+CACHE_COMPONENTS = {
+    'KernelCache', 'DeviceTree', 'StaticTrustCache', 'Cryptex1,SystemTrustCache',
+    'Cryptex1,AppTrustCache', 'OS', 'Cryptex1,SystemOS',
+}
+WIFI_REPOSITORY = 'https://gitlab.com/kernel-firmware/linux-firmware'
+WIFI_COMMIT = '6d6bffb1d85a1fe077f26853edce482f6c112f2b'
+WIFI_MANIFEST_SHA256 = 'f474f2a5a157bc59c804029532231a9a1cee16725018d37212972f11a0868570'
+WIFI_FILES = ('amss.bin', 'm3.bin', 'board-2.bin')
 OVERLAY = {
     'path': 'patches/mesa/turnip-frame-diagnostics.patch',
     'before_sha256': '5eb8dda6e381f10fa48b62a9a497fb74a8b08c7999dea5468585c9848b2af966',
@@ -111,6 +122,107 @@ def restore_seed(workspace):
     return target
 
 
+def wifi_inputs(workspace):
+    """Read only the unchanged, pinned board inventory under real directories."""
+    workspace = workspace.resolve()
+    directory = workspace
+    for part in ('device', 'firmware', 'wcn7850'):
+        directory = directory / part
+        if (directory.is_symlink() or
+                (hasattr(directory, 'is_junction') and directory.is_junction()) or not directory.is_dir()):
+            fail('WCN7850 input directory is missing or is a filesystem link.')
+    if not directory.resolve().is_relative_to(workspace):
+        fail('WCN7850 input directory escapes the build workspace.')
+    manifest = directory / 'manifest.json'
+    if manifest.is_symlink() or not manifest.is_file():
+        fail('WCN7850 manifest is missing or is a filesystem link.')
+    with manifest.open('rb') as incoming:
+        data = incoming.read(64 * 1024 + 1)
+    if len(data) > 64 * 1024 or hashlib.sha256(data).hexdigest() != WIFI_MANIFEST_SHA256:
+        fail('WCN7850 manifest differs from the unchanged reviewed board inventory.')
+    inventory = json.loads(data)['files']
+    if set(inventory) != set(WIFI_FILES):
+        fail('WCN7850 inventory has unexpected filenames.')
+    for name in WIFI_FILES:
+        expected = inventory[name]
+        if (not isinstance(expected, dict) or set(expected) != {'bytes', 'sha256'} or
+                type(expected['bytes']) is not int or not 0 < expected['bytes'] <= 16 * 1024 ** 2 or
+                not re.fullmatch(r'[0-9a-f]{64}', expected['sha256'])):
+            fail('WCN7850 inventory has an invalid size or SHA-256 pin.')
+    return directory, inventory
+
+
+def wifi_file_matches(path, expected):
+    if (path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()) or
+            not path.is_file() or path.stat().st_size != expected['bytes']):
+        return False
+    return sha256(path) == expected['sha256']
+
+
+def stage_wifi_firmware(workspace, allow_download=True):
+    """Stage public fixed-commit inputs; never replace a conflicting local file."""
+    directory, inventory = wifi_inputs(workspace)
+    missing = []
+    records = []
+    for name in WIFI_FILES:
+        target, expected = directory / name, inventory[name]
+        source_path = 'ath12k/WCN7850/hw2.0/' + name
+        source_url = ('https://gitlab.com/api/v4/projects/48890189/repository/files/' +
+                      source_path.replace('/', '%2F') + '/raw?ref=' + WIFI_COMMIT)
+        records.append({'name': name, 'source_path': source_path, 'source_url': source_url,
+                        'bytes': expected['bytes'], 'sha256': expected['sha256']})
+        if target.is_symlink() or (hasattr(target, 'is_junction') and target.is_junction()):
+            fail(f'WCN7850 {name} is a filesystem link; refusing it.')
+        if target.exists():
+            if not wifi_file_matches(target, expected):
+                fail(f'WCN7850 {name} is a conflicting input; refusing to replace it.')
+        else:
+            missing.append((target, expected, source_url))
+    if missing and not allow_download:
+        fail('WCN7850 inputs were not staged before packaging; verification never fetches them.')
+    pending = []
+    for target, expected, source_url in missing:
+        request = urllib.request.Request(source_url, headers={
+            'User-Agent': 'UniXNU-sheng-first-install', 'Accept': 'application/octet-stream',
+            'Accept-Encoding': 'identity',
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                length = response.headers.get('Content-Length')
+                if length is not None and int(length) != expected['bytes']:
+                    fail(f'WCN7850 {target.name} response has an unexpected byte count.')
+                data = response.read(expected['bytes'] + 1)
+        except (urllib.error.URLError, OSError, ValueError):
+            # Redirects can contain transient signed URLs; never echo them or HTTP request details.
+            fail(f'WCN7850 {target.name} public download failed; no URL or credential is logged.')
+        if len(data) != expected['bytes'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
+            fail(f'WCN7850 {target.name} public download differs from its size/SHA-256 pin.')
+        pending.append((target, data))
+    temporaries = []
+    try:
+        for target, data in pending:
+            temporary = directory / ('.wifi-' + target.name + '-' + uuid.uuid4().hex + '.part')
+            with temporary.open('xb') as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            temporaries.append(temporary)
+            try:
+                os.link(temporary, target)  # atomic publication and no overwrite
+            except FileExistsError:
+                fail(f'WCN7850 {target.name} appeared concurrently; refusing replacement.')
+        if any(not wifi_file_matches(directory / name, inventory[name]) for name in WIFI_FILES):
+            fail('Staged WCN7850 inputs changed before packaging.')
+    finally:
+        for temporary in temporaries:
+            if temporary.parent.resolve() == directory.resolve() and temporary.name.startswith('.wifi-'):
+                temporary.unlink(missing_ok=True)
+    print('WCN7850 public firmware inputs match all three unchanged board size/SHA-256 pins.')
+    return {'repository': WIFI_REPOSITORY, 'commit': WIFI_COMMIT,
+            'manifest_path': 'firmware/wcn7850/manifest.json', 'manifest_sha256': WIFI_MANIFEST_SHA256,
+            'files': records, 'verified': True}
+
+
 def apply_overlay(workspace):
     target = workspace / 'UniXNU' / OVERLAY['path']
     before = target.read_bytes()
@@ -133,10 +245,14 @@ def cache_record(path):
         data = read_json(path)
     except (ValueError, OSError):
         return None
-    allowed = {'member', 'size', 'bytes', 'sha256', 'aea_sha256'}
+    allowed = {'member', 'size', 'bytes', 'sha256', 'aea_sha256', 'component', 'source'}
     if not isinstance(data, dict) or set(data) - allowed:
         return None
     if any(not isinstance(value, (str, int)) for value in data.values()):
+        return None
+    if 'component' in data and data['component'] not in CACHE_COMPONENTS:
+        return None
+    if 'source' in data and data['source'] not in ('remote', 'local'):
         return None
     if any(isinstance(value, str) and ('://' in value or '?' in value or 'token' in value.lower()) for value in data.values()):
         return None
@@ -176,17 +292,29 @@ def restore_cache(workspace):
 def collect_cache(workspace):
     source = workspace / 'UniXNU' / 'out' / 'ipsw' / '24A446'
     if not source.is_dir():
+        print('Public IPSW caches skipped: extracted-input directory is missing.')
         return
     output = workspace / '.first-install-cache'
     small_total = 0
     for payload in sorted(source.iterdir()):
-        if (not payload.is_file() or payload.is_symlink() or
-                not (payload.suffix in ('.im4p', '.trustcache', '.im4m') or payload.name.startswith(('kernelcache.', 'DeviceTree.')))):
+        if payload.suffix in ('.json', '.partial'):
+            continue
+        name = redact(payload.name)
+        if not payload.is_file() or payload.is_symlink():
+            print(f'IPSW small cache skip {name}: input is not a regular file.')
+            continue
+        if not (payload.suffix in ('.im4p', '.trustcache', '.im4m') or payload.name.startswith(('kernelcache.', 'DeviceTree.'))):
+            print(f'IPSW small cache skip {name}: not a selected small public member.')
             continue
         size = payload.stat().st_size
         record = payload.with_suffix(payload.suffix + '.json')
         metadata = cache_record(record)
-        if metadata is None or small_total + size + record.stat().st_size > SMALL_CACHE_LIMIT:
+        if metadata is None:
+            reason = 'metadata is missing' if not record.is_file() else 'metadata schema or values were rejected'
+            print(f'IPSW small cache skip {name}: {reason}.')
+            continue
+        if small_total + size + record.stat().st_size > SMALL_CACHE_LIMIT:
+            print(f'IPSW small cache skip {name}: {size} bytes would exceed the 256 MiB total limit.')
             continue
         if sha256(payload) != metadata.get('sha256'):
             fail('IPSW small cache payload differs from its recorded hash.')
@@ -194,20 +322,33 @@ def collect_cache(workspace):
         copy_cache_file(payload, target / payload.name)
         copy_cache_file(record, target / record.name)
         small_total += size + record.stat().st_size
+        print(f'IPSW small cache prepared {name}: {size} payload bytes.')
     if os.environ.get('CACHE_DECRYPTED_OS', '').lower() == 'true':
         payload = source / OS_DISK_IMAGE
         record = payload.with_suffix(payload.suffix + '.json')
         origin = payload.with_suffix(payload.suffix + '.aea.json')
         metadata, archive = cache_record(record), cache_record(origin)
-        if payload.is_file() and not payload.is_symlink() and metadata and archive:
-            if payload.stat().st_size > OS_CACHE_LIMIT:
-                print('Decrypted OS cache skipped because it exceeds the optional 8 GiB limit.')
+        if not payload.is_file() or payload.is_symlink():
+            print('Decrypted OS cache skipped: the regular decrypted image is missing.')
+        elif metadata is None:
+            reason = 'is missing' if not record.is_file() else 'has rejected schema or values'
+            print(f'Decrypted OS cache skipped: plain-image metadata {reason}.')
+        elif archive is None:
+            reason = 'is missing' if not origin.is_file() else 'has rejected schema or values'
+            print(f'Decrypted OS cache skipped: AEA-origin metadata {reason}.')
+        else:
+            total = sum(item.stat().st_size for item in (payload, record, origin))
+            if total > OS_CACHE_LIMIT:
+                print(f'Decrypted OS cache skipped: {total} bytes exceeds the optional 9 GiB total limit.')
             elif (sha256(payload) != metadata.get('sha256') or metadata.get('aea_sha256') != archive.get('sha256')):
                 fail('Decrypted OS cache identities do not match.')
             else:
                 for item in (payload, record, origin):
                     copy_cache_file(item, output / 'ipsw-os' / item.name)
-    print(f'Prepared at most {SMALL_CACHE_LIMIT // 1024 ** 2} MiB of public IPSW members; decrypted OS caching is explicit opt-in.')
+                print(f'Decrypted OS cache prepared: {total} bytes within the optional 9 GiB limit.')
+    else:
+        print('Decrypted OS cache skipped: explicit opt-in is disabled.')
+    print(f'Prepared {small_total} bytes of small public IPSW inputs (256 MiB limit).')
 
 
 def collect_logs(workspace):
@@ -266,6 +407,7 @@ def preflight(workspace):
     helper = Path(__file__).with_name('rebuild_vroot.py')
     if not helper.is_file():
         fail('Missing reviewed rebuild_vroot.py helper.')
+    wifi_inputs(workspace)
     preserved_seed(workspace)
     print('Source revisions, target profile and measured partition capacity match the installation plan.')
     print('The start/end LBA values are source references; direct GPT confirmation is still required before flashing.')
@@ -273,6 +415,7 @@ def preflight(workspace):
 
 
 def verify(workspace):
+    wifi = stage_wifi_firmware(workspace, allow_download=False)
     work = work_path(workspace)
     package = read_json(work / 'package.manifest.json')
     if package['device'] != 'sheng' or package['os_profile'] != PROFILE:
@@ -346,6 +489,7 @@ def verify(workspace):
         'source_overlays': [dict(OVERLAY)],
         'preserved_seed_run_id': os.environ.get('PRESERVED_SEED_RUN_ID', ''),
         'original_seed_sha256': ORIGINAL_SEED_SHA256,
+        'runtime_firmware': {'wcn7850': wifi},
         'partition_measurements': {
             'userdata_bytes': USERDATA_BYTES,
             'boot_partition_bytes': BOOT_BYTES,
@@ -381,6 +525,7 @@ def build(workspace):
     restore_cache(workspace)
     seed = restore_seed(workspace)
     apply_overlay(workspace)
+    stage_wifi_firmware(workspace)
     command(['bash', 'scripts/package.sh', '--os', '27', '--uefi', '../uefi-sheng', '--data-ramdisk', seed],
             workspace / 'device', log_file=workspace / 'installation-evidence' / 'package.stdout.log')
     target = work_path(workspace) / 'userdata-first-install'
